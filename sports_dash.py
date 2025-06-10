@@ -1,221 +1,194 @@
-# sports_dash.py – Streamlit dashboard with live web‑fetched data
+# sports_dash.py – Streamlit dashboard with live web‑fetched data (robust parsing)
 # Run with:  streamlit run sports_dash.py
-# NOTE: Requires internet access from the host running Streamlit.
-# If you are behind a firewall proxy, set env vars HTTP_PROXY / HTTPS_PROXY.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
+import requests, math, re
 from datetime import date, datetime
-from functools import lru_cache
 
 st.set_page_config(page_title="Daily Sports Predictions", layout="wide")
 TODAY = date.today().strftime("%Y-%m-%d")
 
 # -----------------------------------------------------------------------------
-# 1. Utility helpers
+# Helpers for web fetching & caching
 # -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=4 * 60 * 60)  # refresh every 4 h
-def fetch_table(url: str, match: str) -> pd.DataFrame:
-    """Loads the first HTML table containing *match* regex from *url*."""
+@st.cache_data(ttl=4 * 60 * 60)
+def fetch_table(url: str, regex: str) -> pd.DataFrame:
+    """Return first HTML table in *url* whose text matches *regex* (case‑insensitive)."""
     try:
-        tbls = pd.read_html(url, match=match)
-        return tbls[0]
-    except Exception as err:
-        st.error(f"Error fetching {url}: {err}")
+        tables = pd.read_html(url, flavor=["lxml", "bs4"])
+        for tb in tables:
+            if tb.astype(str).apply(lambda s: s.str.contains(regex, flags=re.I)).any().any():
+                return tb
+        return pd.DataFrame()
+    except Exception as exc:
+        st.error(f"Error fetching {url}: {exc}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=4 * 60 * 60)
 def fetch_json(url: str) -> dict:
-    """Simple GET to JSON endpoint with caching."""
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
         return r.json()
-    except Exception as err:
-        st.error(f"Error fetching {url}: {err}")
+    except Exception as exc:
+        st.error(f"Error fetching {url}: {exc}")
         return {}
 
 # -----------------------------------------------------------------------------
-# 2. FOOTBALL – CONMEBOL predictions (Poisson hierarchical)
+# 1. FOOTBALL – CONMEBOL (Poisson hierarchical)
 # -----------------------------------------------------------------------------
 
-def conmebol_predictions(match_day: str = TODAY):
-    wiki_url = "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup_qualification_(CONMEBOL)"
-    standings = fetch_table(wiki_url, "Team")
-    if standings.empty:
+def conmebol_predictions():
+    wiki = "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup_qualification_(CONMEBOL)"
+    raw = fetch_table(wiki, r"Team|Equipo")
+    if raw.empty:
+        st.error("No se pudo leer la tabla de posiciones CONMEBOL.")
         return pd.DataFrame()
 
-    # Clean & rename columns
-    standings = standings[["Team", "Pld", "GF", "GA"]]
-    standings.columns = ["Team", "MP", "GF", "GA"]
+    # Detect column names robustamente
+    def col_like(df, *cands):
+        for c in cands:
+            matches = [col for col in df.columns if col.lower() == c.lower()]
+            if matches:
+                return matches[0]
+        return None
 
-    # Convert numeric
-    for col in ("MP", "GF", "GA"):
-        standings[col] = pd.to_numeric(standings[col], errors="coerce")
+    team_c = col_like(raw, "Team", "Teams", "Equipo")
+    mp_c   = col_like(raw, "Pld", "MP", "Played", "J")
+    gf_c   = col_like(raw, "GF", "F", "Goals for")
+    ga_c   = col_like(raw, "GA", "A", "Goals against")
 
-    # Fixtures today (scrape the Results section – limited rows)
-    fixtures_all = fetch_table(wiki_url, "\d{1,2}\s+June\s+2025")
-    if fixtures_all.empty:
-        st.warning("No fixtures scraped; falling back to manual list.")
+    if None in (team_c, mp_c, gf_c, ga_c):
+        st.error("No se encontraron todas las columnas necesarias en la tabla CONMEBOL.")
+        return pd.DataFrame()
+
+    standings = raw[[team_c, mp_c, gf_c, ga_c]].rename(columns={
+        team_c: "Team", mp_c: "MP", gf_c: "GF", ga_c: "GA"})
+
+    standings[["MP", "GF", "GA"]] = standings[["MP", "GF", "GA"]].apply(pd.to_numeric, errors="coerce")
+    standings = standings.dropna()
+
+    # Intentar extraer fixtures de hoy; si falla usar manual
+    fx_raw = fetch_table(wiki, TODAY.split("-")[2] + r"\s+" + datetime.today().strftime("%B"))
+    fixtures = []
+    if not fx_raw.empty and fx_raw.shape[1] >= 3:
+        for _, r in fx_raw.iterrows():
+            fixtures.append({"Home": str(r[0]).strip(), "Away": str(r[2]).strip()})
+    if not fixtures:
         fixtures = [
             {"Home": "Argentina", "Away": "Colombia"},
             {"Home": "Brazil", "Away": "Paraguay"},
             {"Home": "Bolivia", "Away": "Chile"},
             {"Home": "Peru", "Away": "Ecuador"},
         ]
-    else:
-        fixtures = []
-        for _, row in fixtures_all.iterrows():
-            h, a = str(row[0]), str(row[2])  # table format: Home, score, Away
-            fixtures.append({"Home": h.replace("\xa0", " "), "Away": a.replace("\xa0", " ")})
 
-    alpha = 1.5  # Laplace smoothing
-    league_GF = (standings["GF"] + alpha).sum()
-    league_MP = (standings["MP"] + alpha).sum()
-    league_avg = (league_GF / league_MP) / 2  # goals per team‑match
-
+    # Poisson model
+    alpha = 1.5
+    league_avg = ((standings["GF"] + alpha).sum() / (standings["MP"] + alpha).sum()) / 2
     standings = standings.set_index("Team")
-    standings["attack"] = ((standings["GF"] + alpha) / (standings["MP"] + alpha)) / league_avg
+    standings["attack"]  = ((standings["GF"] + alpha) / (standings["MP"] + alpha)) / league_avg
     standings["defence"] = ((standings["GA"] + alpha) / (standings["MP"] + alpha)) / league_avg
 
-    def poisson_pmf(lmbd, k):
-        return np.exp(-lmbd) * (lmbd ** k) / math.factorial(k)
+    def pmf(lmbd, k):
+        return math.exp(-lmbd) * (lmbd ** k) / math.factorial(k)
 
     rows = []
     for fx in fixtures:
         h, a = fx["Home"], fx["Away"]
         if h not in standings.index or a not in standings.index:
             continue
-        lh = league_avg * standings.loc[h, "attack"] * standings.loc[a, "defence"] * 1.12
-        la = league_avg * standings.loc[a, "attack"] * standings.loc[h, "defence"]
-        # Outcome probs via truncated Poisson convolution
-        p_home = p_draw = p_away = p_over25 = 0.0
+        λh = league_avg * standings.loc[h, "attack"] * standings.loc[a, "defence"] * 1.12
+        λa = league_avg * standings.loc[a, "attack"] * standings.loc[h, "defence"]
+        ph = pd = pa = po25 = 0.0
         for i in range(7):
             for j in range(7):
-                p = poisson_pmf(lh, i) * poisson_pmf(la, j)
-                if i > j:
-                    p_home += p
-                elif i == j:
-                    p_draw += p
-                else:
-                    p_away += p
-                if i + j > 2:
-                    p_over25 += p
-        rows.append({
-            "Home": h, "Away": a,
-            "ExpGoals_H": round(lh, 2), "ExpGoals_A": round(la, 2),
-            "P(Home)": round(p_home, 3), "P(Draw)": round(p_draw, 3),
-            "P(Away)": round(p_away, 3), "P(>2.5)": round(p_over25, 3),
-        })
-
+                p = pmf(λh, i) * pmf(λa, j)
+                if i > j: ph += p
+                elif i == j: pd += p
+                else: pa += p
+                if i + j > 2: po25 += p
+        rows.append({"Home": h, "Away": a, "Exp_H": round(λh,2), "Exp_A": round(λa,2),
+                     "P(H)": round(ph,3), "P(D)": round(pd,3), "P(A)": round(pa,3), "P(>2.5)": round(po25,3)})
     return pd.DataFrame(rows)
 
 # -----------------------------------------------------------------------------
-# 3. FOOTBALL – UEFA predictions (Elo logistic)
+# 2. FOOTBALL – UEFA (Elo‑logistic)
 # -----------------------------------------------------------------------------
 
-def uefa_predictions(date_str: str = TODAY):
-    # ESPN scoreboard often lists all UEFA qualifiers under soccer/fifa.world
-    espn_url = f"https://site.web.api.espn.com/apis/v2/sports/soccer/fifa.world/scoreboard?dates={date_str}"
-    data = fetch_json(espn_url)
+def uefa_predictions():
+    espn = f"https://site.web.api.espn.com/apis/v2/sports/soccer/fifa.world/scoreboard?dates={TODAY}"
+    data = fetch_json(espn)
     events = data.get("events", [])
     if not events:
-        st.warning("No UEFA events fetched; sample data will be shown.")
-        sample = pd.DataFrame([
-            {"Home": "Finland", "Away": "Poland", "P(Home)": 0.17, "P(Away)": 0.83},
-            {"Home": "Netherlands", "Away": "Malta", "P(Home)": 0.991, "P(Away)": 0.009},
-        ])
-        return sample
+        return pd.DataFrame()
 
-    # Fetch Elo ratings table (static CSV hosted on GitHub)
-    elo_url = "https://raw.githubusercontent.com/tadhg-ohiggins/fifa-elo-ratings/main/data/fifa_elo_latest.csv"
-    elo_df = fetch_table(elo_url, "Team")
-    if elo_df.empty:
-        st.warning("Elo ratings unavailable; falling back to equal strength.")
+    elo_csv = "https://raw.githubusercontent.com/tadhg-ohiggins/fifa-elo-ratings/main/data/fifa_elo_latest.csv"
+    elo_df = fetch_table(elo_csv, "elo")
 
-    def elo(team):
-        if elo_df.empty:
-            return 1500
-        row = elo_df[elo_df["team"] == team]
-        if row.empty:
-            return 1500
-        return float(row.iloc[0]["elo"])
+    def elo(t):
+        if elo_df.empty: return 1500
+        row = elo_df[elo_df["team"] == t]
+        return float(row.iloc[0]["elo"]) if not row.empty else 1500
 
-    rows = []
+    rec = []
     for ev in events:
         comp = ev["competitions"][0]
         if comp.get("type", {}).get("slug") != "uefa":
-            continue  # skip non‑UEFA matches
+            continue
         h, a = comp["competitors"]
         home = h if h["homeAway"] == "home" else a
         away = a if h["homeAway"] == "home" else h
-        home_team = home["team"]["shortDisplayName"]
-        away_team = away["team"]["shortDisplayName"]
-        ph = 1 / (1 + 10 ** (-(elo(home_team) + 60 - elo(away_team)) / 400))
-        rows.append({"Home": home_team, "Away": away_team, "P(Home)": round(ph, 3), "P(Away)": round(1 - ph, 3)})
-
-    return pd.DataFrame(rows)
+        th, ta = home["team"]["shortDisplayName"], away["team"]["shortDisplayName"]
+        ph = 1 / (1 + 10 ** (-(elo(th)+60-elo(ta))/400))
+        rec.append({"Home": th, "Away": ta, "P(Home)": round(ph,3), "P(Away)": round(1-ph,3)})
+    return pd.DataFrame(rec)
 
 # -----------------------------------------------------------------------------
-# 4. BASKETBALL – WNBA predictions (record‑based quick model)
+# 3. BASKET – WNBA (win‑ratio)
 # -----------------------------------------------------------------------------
 
-def wnba_predictions(date_str: str = TODAY):
-    url = f"https://site.web.api.espn.com/apis/v2/sports/basketball/wnba/scoreboard?dates={date_str}"
+def wnba_predictions():
+    url = f"https://site.web.api.espn.com/apis/v2/sports/basketball/wnba/scoreboard?dates={TODAY}"
     data = fetch_json(url)
     events = data.get("events", [])
-    rows = []
+    out = []
     for ev in events:
         comp = ev["competitions"][0]
-        comp_team = comp["competitors"]
-        home = next(t for t in comp_team if t["homeAway"] == "home")
-        away = next(t for t in comp_team if t["homeAway"] == "away")
-        def win_pct(team_json):
-            rec = team_json.get("records", [{"summary": "0-0"}])[0]["summary"]
-            w, l = map(int, rec.split("-"))
-            return w / (w + l + 1e-9)
-        wp_h, wp_a = win_pct(home), win_pct(away)
-        ph = wp_h / (wp_h + wp_a + 1e-9)
-        rows.append({
-            "Home": home["team"]["displayName"],
-            "Away": away["team"]["displayName"],
-            "P(Home)": round(ph, 3),
-            "P(Away)": round(1 - ph, 3),
-        })
-    return pd.DataFrame(rows)
+        h = next(t for t in comp["competitors"] if t["homeAway"]=="home")
+        a = next(t for t in comp["competitors"] if t["homeAway"]=="away")
+        def wp(t):
+            w,l = map(int, t.get("records",[{"summary":"0-0"}])[0]["summary"].split("-"))
+            return w/(w+l+1e-6)
+        ph = wp(h)/(wp(h)+wp(a)+1e-6)
+        out.append({"Home": h["team"]["shortDisplayName"], "Away": a["team"]["shortDisplayName"],
+                    "P(Home)": round(ph,3), "P(Away)": round(1-ph,3)})
+    return pd.DataFrame(out)
 
 # -----------------------------------------------------------------------------
-# 5. STREAMLIT UI
+# 4. STREAMLIT UI
 # -----------------------------------------------------------------------------
 
-SPORT_FUNCS = {
-    "Fútbol – Sudamérica": conmebol_predictions,
-    "Fútbol – Europa (UEFA)": uefa_predictions,
-    "Basketball – WNBA": wnba_predictions,
-}
+MODS = {"Fútbol – Sudamérica": conmebol_predictions,
+        "Fútbol – Europa (UEFA)": uefa_predictions,
+        "Basketball – WNBA": wnba_predictions}
 
-st.sidebar.title("⚽🏀 Daily Sports Predictions (Live)")
-sel = st.sidebar.radio("Selecciona deporte/ámbito:", list(SPORT_FUNCS.keys()))
+st.sidebar.title("⚽🏀 Predicciones deportivas (en vivo)")
+choice = st.sidebar.radio("Selecciona bloque:", list(MODS.keys()))
 
 st.title(f"Predicciones • {datetime.today().strftime('%d %B %Y')}")
 
-with st.spinner("Cargando datos en vivo…"):
-    df = SPORT_FUNCS[sel]()
+with st.spinner("Cargando datos …"):
+    df = MODS[choice]()
 
 if df.empty:
-    st.error("No se pudieron obtener datos en vivo.")
+    st.warning("No se pudieron obtener datos en vivo para el bloque seleccionado.")
 else:
     st.dataframe(df, use_container_width=True, hide_index=True)
-    # Edge detector ≥55 %
-    if "P(Home)" in df.columns:
-        edge_df = df[df["P(Home)"] >= 0.55]
-        if not edge_df.empty:
-            st.subheader("Edges potenciales (P(Home) ≥ 55 %)")
-            st.table(edge_df[["Home", "Away", "P(Home)"]])
-        else:
-            st.info("Sin edges claros ≥55 % para partidos listados.")
+    if "P(H)" in df.columns and (df["P(H)"] >= 0.55).any():
+        st.subheader("Posibles edges (P(H) ≥ 55 %)")
+        st.table(df[df["P(H)"] >= 0.55][["Home","Away","P(H)"]])
 
-st.caption("© 2025 – Datos en vivo vía Wikipedia & ESPN. Modelo Poisson jerárquico (CONMEBOL), Elo simple (UEFA) y record‑ratio (WNBA). Sustituye por tus feeds/API comerciales para mayor precisión.")
+st.caption("© 2025 – Modelos: Poisson (CONMEBOL), Elo (UEFA), win‑ratio (WNBA). Datos Wikipedia & ESPN.")

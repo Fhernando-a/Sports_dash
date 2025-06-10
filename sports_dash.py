@@ -176,7 +176,7 @@ sel = st.sidebar.radio("Bloque:", list(MODS.keys()))
 # --- Botón para refrescar cuotas y limpiar caché ---
 if st.sidebar.button("🔄 Refrescar cuotas ahora"):
     st.cache_data.clear()
-    st.experimental_rerun()
+    st.rerun()
 
 
 st.title(f"Predicciones • {TODAY.strftime('%d %B %Y')}")
